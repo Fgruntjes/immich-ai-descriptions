@@ -109,10 +109,20 @@ async def lifespan(app: FastAPI):
     build_engine()
 
     logger.info(f"Started — Immich: {IMMICH_API_URL}, Data: {DATA_DIR}")
+    scheduler = asyncio.create_task(_scheduler())
     yield
 
+    scheduler.cancel()
+    try:
+        await scheduler
+    except asyncio.CancelledError:
+        pass
     if _task and not _task.done():
         engine.stop()
+        await asyncio.sleep(1)
+    if _audit_task and not _audit_task.done():
+        if engine:
+            engine._stop_event.set()
         await asyncio.sleep(1)
     if immich:
         await immich.close()
@@ -151,24 +161,15 @@ async def dashboard(request: Request):
 # --- Stats & Recent polling endpoints ---
 
 
-_library_count_cache = {"count": 0, "fetched_at": 0.0}
-
-
 @app.get("/stats", response_class=HTMLResponse)
 async def stats_partial():
     stats = state_db.get_stats() if state_db else {"done": 0, "failed": 0, "skipped": 0, "total_processed": 0}
 
-    # Cache library count (refresh every 5 minutes)
-    now = _time.monotonic()
-    if now - _library_count_cache["fetched_at"] > 300 and immich:
-        try:
-            resp = await immich.client.get(f"{immich.api_url}/server/statistics")
-            if resp.status_code == 200:
-                _library_count_cache["count"] = resp.json().get("photos", 0)
-                _library_count_cache["fetched_at"] = now
-        except Exception:
-            pass
-    library = _library_count_cache["count"]
+    # Use library_count from last batch run (ground truth from Immich search API)
+    row = state_db.conn.execute(
+        "SELECT value FROM metadata WHERE key = 'library_count'"
+    ).fetchone() if state_db else None
+    library = int(row["value"]) if row else 0
     remaining = max(0, library - stats.get("total_processed", 0))
 
     return HTMLResponse(f"""
@@ -231,6 +232,8 @@ async def save_settings(request: Request):
     # Handle checkbox (unchecked = absent from form)
     if "overwrite_existing" not in form:
         state_db.set_config("overwrite_existing", "false")
+    if "quality_gate_enabled" not in form:
+        state_db.set_config("quality_gate_enabled", "false")
     build_engine()
     return HTMLResponse(
         '<span class="text-ok text-xs font-mono" style="animation:fadeUp 0.3s ease-out">Saved</span>'
@@ -423,12 +426,30 @@ def _task_done_callback(task: asyncio.Task):
         pass
 
 
+async def _scheduler():
+    """Background scheduler: runs a batch every watch_interval_hours."""
+    while True:
+        hours = int(state_db.get_config("watch_interval_hours", "24"))
+        logger.info(f"Scheduler: next run in {hours}h")
+        await asyncio.sleep(hours * 3600)
+        # Skip if a batch or audit is already running
+        if (_task and not _task.done()) or (_audit_task and not _audit_task.done()):
+            logger.info("Scheduler: skipped — batch or audit already running")
+            continue
+        logger.info("Scheduler: starting scheduled batch")
+        build_engine()
+        _task_ref = asyncio.create_task(engine.run_batch(resume=True))
+        _task_ref.add_done_callback(_task_done_callback)
+        # Update globals so UI tracks it
+        globals()["_task"] = _task_ref
+        globals()["_running_engine"] = engine
+
+
 @app.post("/run/start")
 async def start_run(request: Request):
     global _task, _running_engine
     if _task and not _task.done():
         return JSONResponse({"error": "Already running"}, status_code=409)
-    resume = request.query_params.get("resume") == "true"
     fresh = request.query_params.get("fresh") == "true"
     build_engine()
     if fresh:
@@ -437,7 +458,7 @@ async def start_run(request: Request):
         state_db.conn.commit()
         logger.info("Fresh start: cleared all processed assets and last_run_timestamp")
     _running_engine = engine
-    _task = asyncio.create_task(engine.run_batch(resume=resume or fresh))
+    _task = asyncio.create_task(engine.run_batch(resume=True))
     _task.add_done_callback(_task_done_callback)
     return JSONResponse({"status": "started"})
 
@@ -520,12 +541,15 @@ async def run_status():
     <div class="space-y-4">
         <div class="flex items-center gap-3 flex-wrap">
             <button onclick="fetch('/run/start',{{method:'POST'}})" class="btn btn-warm btn-sm">Start Processing</button>
-            <button onclick="fetch('/run/start?resume=true',{{method:'POST'}})" class="btn btn-ghost btn-sm">Resume</button>
             <button onclick="fetch('/run/reset-failed',{{method:'POST'}})" class="btn btn-ghost btn-sm">Reset Failed</button>
-            <button onclick="if(confirm('This will clear ALL processed assets and re-scan everything from scratch. Continue?'))fetch('/run/start?fresh=true',{{method:'POST'}})"
+            <button onclick="if(confirm('WARNING: This will DELETE all {state_db.get_stats().get('done',0)} tracked records from the database and re-generate descriptions for ALL photos from scratch.\\n\\nExisting descriptions in Immich will be OVERWRITTEN.\\n\\nThis action cannot be undone. Continue?'))fetch('/run/start?fresh=true',{{method:'POST'}})"
                 class="btn btn-ghost btn-sm text-err">Start Fresh</button>
         </div>
-        <p class="text-txt-3 text-xs font-mono">Ready to process unprocessed assets</p>
+        <div class="mt-2 space-y-1 text-txt-3" style="font-size:11px">
+            <p><span class="text-warm">Start Processing</span> — scans your library, skips already-described photos, processes the rest</p>
+            <p><span class="text-txt-2">Reset Failed</span> — clears failed records so they get retried on next run</p>
+            <p><span class="text-err">Start Fresh</span> — wipes all tracking and re-processes every photo from scratch</p>
+        </div>
     </div>"""
     return HTMLResponse(html)
 
@@ -544,6 +568,9 @@ async def list_assets(status: str = None, limit: int = 50):
         dot = {"done": "dot-ok", "failed": "dot-err"}.get(a["status"], "dot-warn")
         preview = escape((a.get("description_preview") or a.get("error") or "")[:100])
         dur = f'{a.get("duration_ms", 0)}ms' if a.get("duration_ms") else "-"
+        score = a.get("quality_score")
+        score_html = f'{score:.2f}' if score is not None else "-"
+        score_class = "text-err" if score is not None and score > float(state_db.get_config("repetition_threshold", "0.3")) else "text-txt-3"
         ts = (a.get("processed_at") or "")[:16]
         model = escape(a.get("model_used") or "-")
         aid = a["asset_id"]
@@ -565,16 +592,17 @@ async def list_assets(status: str = None, limit: int = 50):
             <td class="text-xs max-w-md truncate text-txt-2">{preview}</td>
             <td class="font-mono text-xs text-txt-3">{model}</td>
             <td class="font-mono text-xs text-txt-3">{dur}</td>
+            <td class="font-mono text-xs {score_class}">{score_html}</td>
             <td class="font-mono text-xs text-txt-3">{ts}</td>
             <td>{retry}</td>
         </tr>
-        <tr class="asset-detail hidden"><td colspan="7" class="p-0">
+        <tr class="asset-detail hidden"><td colspan="8" class="p-0">
             <div class="px-4 py-2 text-txt-3 text-xs">Loading...</div>
         </td></tr>"""
 
     return HTMLResponse(f"""<table class="data-table">
         <thead><tr>
-            <th>Status</th><th>Asset</th><th>Preview</th><th>Model</th><th>Time</th><th>Date</th><th></th>
+            <th>Status</th><th>Asset</th><th>Preview</th><th>Model</th><th>Time</th><th>Score</th><th>Date</th><th></th>
         </tr></thead>
         <tbody>{rows}</tbody>
     </table>""")
@@ -583,18 +611,14 @@ async def list_assets(status: str = None, limit: int = 50):
 @app.get("/assets/{asset_id}", response_class=HTMLResponse)
 async def asset_detail(asset_id: str):
     """Returns detail HTML for an asset: thumbnail, prompt, description, provider info."""
-    row = None
-    for r in state_db.get_recent(1000):
-        if r["asset_id"] == asset_id:
-            row = r
-            break
+    row = state_db.get_asset(asset_id)
 
     if not row:
-        return HTMLResponse('<td colspan="7" class="p-4 text-txt-3 text-xs">Not found</td>')
+        return HTMLResponse('<td colspan="8" class="p-4 text-txt-3 text-xs">Not found</td>')
 
     # Fetch full description from Immich (DB preview is truncated to 200 chars)
     full_desc = row.get("description_preview") or ""
-    if immich and row.get("status") == "done":
+    if immich and row.get("status") in ("done", "failed"):
         try:
             detail = await immich.get_asset(asset_id)
             full_desc = detail.get("exifInfo", {}).get("description") or full_desc
@@ -606,11 +630,13 @@ async def asset_detail(asset_id: str):
     endpoint = escape(row.get("endpoint_used") or "-")
     pid = row.get("provider_id") or "-"
     dur = f'{row.get("duration_ms", 0)}ms' if row.get("duration_ms") else "-"
+    score = row.get("quality_score")
+    score_str = f'{score:.2f}' if score is not None else "N/A"
     error = escape(row.get("error") or "")
 
     immich_link = f"https://photos.maheidem.com/photos/{asset_id}"
 
-    return HTMLResponse(f"""<td colspan="7" style="padding:0">
+    return HTMLResponse(f"""<td colspan="8" style="padding:0">
     <div style="background:#161925;border:1px solid #2a2d3a;border-radius:10px;padding:16px;margin:4px 8px">
         <div style="display:flex;gap:16px">
             <img src="/assets/{asset_id}/thumbnail" alt=""
@@ -622,6 +648,7 @@ async def asset_detail(asset_id: str):
                     <span style="color:#888;font-family:monospace;font-size:11px;margin-right:12px">Provider #{pid}</span>
                     <span style="color:#888;font-family:monospace;font-size:11px;margin-right:12px">{model}</span>
                     <span style="color:#888;font-family:monospace;font-size:11px">{dur}</span>
+                    <span style="color:#888;font-family:monospace;font-size:11px">Score: {score_str}</span>
                 </div>
                 {f'<div style="color:#f87171;font-size:12px;margin-bottom:6px">Error: {error}</div>' if error else ''}
                 <div style="color:#777;font-size:10px;font-family:monospace;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px">Description</div>
@@ -656,7 +683,7 @@ async def retry_asset(asset_id: str):
     )
     state_db.conn.commit()
     return HTMLResponse(
-        '<tr><td colspan="7" class="text-ok text-xs font-mono py-2 px-3">'
+        '<tr><td colspan="8" class="text-ok text-xs font-mono py-2 px-3">'
         "Queued for retry on next run</td></tr>"
     )
 
@@ -811,6 +838,11 @@ async def preview_generate(asset_id: str, request: Request):
                 prompt_text, image_b64,
             )
 
+        from engine import compute_repetition_score
+        quality_score = compute_repetition_score(description)
+        threshold = float(state_db.get_config("repetition_threshold", "0.3"))
+        score_color = "#f87171" if quality_score > threshold else "#5a5862"
+
         duration = _time.monotonic() - start
         dur_str = f"{duration:.1f}s"
         model_str = escape(model_used or "?")
@@ -819,6 +851,7 @@ async def preview_generate(asset_id: str, request: Request):
         <div style="background:#161925;border:1px solid #252836;border-radius:8px;padding:12px;margin-top:4px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
                 <span style="color:#5a5862;font-size:10px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:0.08em">#{used_pid} {model_str}</span>
+                <span style="color:{score_color};font-size:11px;font-family:'JetBrains Mono',monospace">score: {quality_score:.2f}</span>
                 <span style="color:#5a5862;font-size:11px;font-family:'JetBrains Mono',monospace">{dur_str}</span>
             </div>
             <p style="color:#c8c6c3;font-size:13px;line-height:1.6;margin:0">{escape(description)}</p>
@@ -832,6 +865,48 @@ async def preview_generate(asset_id: str, request: Request):
 async def reset_failed():
     state_db.reset_failed()
     return JSONResponse({"status": "ok"})
+
+
+_audit_task: asyncio.Task = None
+_running_audit_engine: ProcessingEngine = None
+
+
+@app.post("/audit/start")
+async def start_audit():
+    global _audit_task, _running_audit_engine
+    if _audit_task and not _audit_task.done():
+        return JSONResponse({"error": "Audit already running"}, status_code=409)
+    if _task and not _task.done():
+        return JSONResponse({"error": "Batch running — wait for it to finish"}, status_code=409)
+    build_engine()
+    _running_audit_engine = engine
+    _audit_task = asyncio.create_task(engine.run_audit())
+    return JSONResponse({"status": "started"})
+
+
+@app.get("/audit/status", response_class=HTMLResponse)
+async def audit_status():
+    if _audit_task and not _audit_task.done():
+        active = _running_audit_engine or engine
+        msg = active.progress.message if active else "Running..."
+        return HTMLResponse(
+            f'<div class="flex items-center gap-2">'
+            f'<div class="dot dot-warn dot-pulse"></div>'
+            f'<span class="text-txt-2 text-xs">{escape(msg)}</span>'
+            f'</div>'
+        )
+    if _audit_task and _audit_task.done():
+        try:
+            result = _audit_task.result()
+            return HTMLResponse(
+                f'<span class="text-ok text-xs font-mono">'
+                f'Audit done: {result["scored"]} scored, {result["flagged"]} flagged</span>'
+            )
+        except Exception as e:
+            return HTMLResponse(
+                f'<span class="text-err text-xs">Error: {escape(str(e))}</span>'
+            )
+    return HTMLResponse("")
 
 
 if __name__ == "__main__":

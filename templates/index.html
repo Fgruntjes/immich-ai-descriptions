@@ -377,12 +377,15 @@
                 {% else %}
                 <div class="flex items-center gap-3 flex-wrap">
                     <button onclick="fetch('/run/start',{method:'POST'})" class="btn btn-warm btn-sm">Start Processing</button>
-                    <button onclick="fetch('/run/start?resume=true',{method:'POST'})" class="btn btn-ghost btn-sm">Resume</button>
                     <button onclick="fetch('/run/reset-failed',{method:'POST'})" class="btn btn-ghost btn-sm">Reset Failed</button>
-                    <button onclick="if(confirm('This will clear ALL processed assets and re-scan everything from scratch. Continue?'))fetch('/run/start?fresh=true',{method:'POST'})"
+                    <button onclick="if(confirm('This will clear ALL tracking and re-describe every photo from scratch. Existing descriptions in Immich will be overwritten.'))fetch('/run/start?fresh=true',{method:'POST'})"
                         class="btn btn-ghost btn-sm text-err">Start Fresh</button>
                 </div>
-                <p class="text-txt-3 text-xs font-mono">Ready to process unprocessed assets</p>
+                <div class="mt-2 space-y-1 text-txt-3" style="font-size:11px">
+                    <p><span class="text-warm">Start Processing</span> — scans your library, skips already-described photos, processes the rest</p>
+                    <p><span class="text-txt-2">Reset Failed</span> — clears failed records so they get retried on next run</p>
+                    <p><span class="text-err">Start Fresh</span> — wipes all tracking and re-processes every photo from scratch</p>
+                </div>
                 {% endif %}
             </div>
         </div>
@@ -392,6 +395,18 @@
             <h3 class="text-xs font-mono uppercase tracking-widest text-txt-3 mb-3">LLM Providers</h3>
             <div hx-get="/endpoints" hx-trigger="load, every 30s" hx-swap="innerHTML">
                 <span class="text-txt-3 text-xs">Checking...</span>
+            </div>
+        </div>
+
+        <!-- Quality Audit -->
+        <div class="glass p-5 mb-6 fade-up delay-4">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-xs font-mono uppercase tracking-widest text-txt-3">Quality Audit</h3>
+                <button onclick="fetch('/audit/start',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.error)alert(d.error)})"
+                    class="btn btn-ghost btn-sm">Run Audit</button>
+            </div>
+            <div hx-get="/audit/status" hx-trigger="every 3s" hx-swap="innerHTML">
+                <span class="text-txt-3 text-xs">Scores existing descriptions for repetition. Flags bad ones as failed for retry.</span>
             </div>
         </div>
 
@@ -498,6 +513,38 @@
                 <div>
                     <label class="block text-xs text-txt-3 mb-1.5">Nearby Window (min)</label>
                     <input name="nearby_window_minutes" type="number" value="{{ config.nearby_window_minutes }}" class="input-field">
+                </div>
+            </div>
+
+            <!-- Quality Gate -->
+            <div class="border-t border-edge pt-5 mt-2">
+                <h4 class="text-xs font-mono uppercase tracking-widest text-txt-3 mb-4">Quality Gate</h4>
+                <div class="grid grid-cols-4 gap-4">
+                    <div>
+                        <label class="block text-xs text-txt-3 mb-1.5">Repetition Threshold</label>
+                        <input name="repetition_threshold" type="number" step="0.05" min="0" max="1"
+                               value="{{ config.repetition_threshold }}" class="input-field">
+                        <p class="text-txt-3 mt-1" style="font-size:10px">0.0-1.0 — reject above</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-txt-3 mb-1.5">Min Words</label>
+                        <input name="min_words" type="number" min="1"
+                               value="{{ config.min_words }}" class="input-field">
+                        <p class="text-txt-3 mt-1" style="font-size:10px">Reject shorter</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-txt-3 mb-1.5">Max Words</label>
+                        <input name="max_words" type="number" min="1"
+                               value="{{ config.max_words }}" class="input-field">
+                        <p class="text-txt-3 mt-1" style="font-size:10px">Reject longer</p>
+                    </div>
+                    <div class="flex items-end pb-4">
+                        <label class="flex items-center gap-2.5 text-sm text-txt-2 cursor-pointer">
+                            <input name="quality_gate_enabled" type="checkbox" value="true"
+                                {% if config.quality_gate_enabled == 'true' %}checked{% endif %}>
+                            Enable quality gate
+                        </label>
+                    </div>
                 </div>
             </div>
 

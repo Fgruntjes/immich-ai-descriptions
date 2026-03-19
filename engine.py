@@ -40,6 +40,10 @@ DEFAULT_PROMPT = (
 DEFAULT_CONFIG = {
     "prompt_template": DEFAULT_PROMPT,
     "overwrite_existing": "false",
+    "quality_gate_enabled": "true",
+    "repetition_threshold": "0.3",
+    "min_words": "10",
+    "max_words": "300",
     "watch_interval_hours": "24",
     "ocr_min_score": "0.5",
     "max_people": "8",
@@ -71,6 +75,21 @@ def desc_hash(text: str) -> str:
 def sanitize(text: str) -> str:
     """Strip null bytes and control characters."""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+
+def compute_repetition_score(text: str) -> float:
+    """Score text repetition 0.0 (unique) to 1.0 (fully repetitive).
+
+    Uses trigram (3-word sliding window) duplicate ratio.
+    Short texts (< 6 words) return 0.0 — not enough data to judge.
+    """
+    words = text.lower().split()
+    if len(words) < 6:
+        return 0.0
+    n = 3
+    trigrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    unique = len(set(trigrams))
+    return 1.0 - (unique / len(trigrams))
 
 
 # --- StateDB ---
@@ -156,6 +175,20 @@ class StateDB:
             self.conn.commit()
             logger.info("Migrated schema to v2 (provider columns in processed)")
 
+        if version < 3:
+            try:
+                self.conn.execute(
+                    "ALTER TABLE processed ADD COLUMN quality_score REAL"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            self.conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) "
+                "VALUES ('schema_version', '3')"
+            )
+            self.conn.commit()
+            logger.info("Migrated schema to v3 (quality_score column)")
+
     def get_config(self, key: str, default: str = None) -> Optional[str]:
         row = self.conn.execute(
             "SELECT value FROM config WHERE key = ?", (key,)
@@ -201,16 +234,16 @@ class StateDB:
     def mark_done(self, asset_id: str, d_hash: str, preview: str,
                   endpoint: str, duration_ms: int,
                   provider_id: int = None, model_used: str = None,
-                  prompt_used: str = None):
+                  prompt_used: str = None, quality_score: float = None):
         self.conn.execute(
             """INSERT OR REPLACE INTO processed
                (asset_id, status, description_hash, description_preview,
                 processed_at, endpoint_used, duration_ms, error,
-                provider_id, model_used, prompt_used)
-               VALUES (?, 'done', ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+                provider_id, model_used, prompt_used, quality_score)
+               VALUES (?, 'done', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
             (asset_id, d_hash, preview[:200],
              datetime.now().isoformat(), endpoint, duration_ms,
-             provider_id, model_used, prompt_used),
+             provider_id, model_used, prompt_used, quality_score),
         )
         self.conn.commit()
 
@@ -303,6 +336,43 @@ class StateDB:
         self.conn.execute("DELETE FROM processed WHERE status = 'failed'")
         self.conn.commit()
 
+    def get_asset(self, asset_id: str) -> Optional[dict]:
+        """Get a single processed asset by ID."""
+        row = self.conn.execute(
+            "SELECT * FROM processed WHERE asset_id = ?", (asset_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_unscored_done_ids(self) -> list[str]:
+        """Get asset IDs that are done but have no quality score."""
+        rows = self.conn.execute(
+            "SELECT asset_id FROM processed "
+            "WHERE status = 'done' AND quality_score IS NULL"
+        ).fetchall()
+        return [r["asset_id"] for r in rows]
+
+    def update_quality_score(self, asset_id: str, score: float):
+        """Set quality score for an already-processed asset."""
+        self.conn.execute(
+            "UPDATE processed SET quality_score = ? WHERE asset_id = ?",
+            (score, asset_id),
+        )
+        self.conn.commit()
+
+    def fail_from_audit(self, asset_id: str, score: float,
+                        reason: str = None):
+        """Mark a done asset as failed due to quality audit."""
+        error_msg = reason or f"quality_audit: score={score:.2f}"
+        self.conn.execute(
+            """UPDATE processed SET status = 'failed',
+               quality_score = ?,
+               error = ?
+               WHERE asset_id = ?""",
+            (score, error_msg,
+             asset_id),
+        )
+        self.conn.commit()
+
     def clear_all(self):
         self.conn.execute("DELETE FROM processed")
         self.conn.commit()
@@ -365,10 +435,10 @@ class StateDB:
     async def async_mark_done(self, asset_id: str, d_hash: str, preview: str,
                               endpoint: str, duration_ms: int,
                               provider_id: int = None, model_used: str = None,
-                              prompt_used: str = None):
+                              prompt_used: str = None, quality_score: float = None):
         async with self._lock:
             self.mark_done(asset_id, d_hash, preview, endpoint, duration_ms,
-                           provider_id, model_used, prompt_used)
+                           provider_id, model_used, prompt_used, quality_score)
 
     async def async_mark_failed(self, asset_id: str, error: str,
                                 endpoint: str = None, duration_ms: int = None,
@@ -964,6 +1034,45 @@ class ProcessingEngine:
                 )
                 return "failed"
 
+            # Quality gate
+            quality_score = compute_repetition_score(description)
+            gate_enabled = self.db.get_config("quality_gate_enabled", "true") == "true"
+
+            if gate_enabled:
+                threshold = float(self.db.get_config("repetition_threshold", "0.3"))
+                min_words = int(self.db.get_config("min_words", "10"))
+                max_words = int(self.db.get_config("max_words", "300"))
+                word_count = len(description.split())
+                reject_reason = None
+
+                if quality_score > threshold:
+                    reject_reason = (
+                        f"quality_gate: repetition_score={quality_score:.2f} "
+                        f"(threshold={threshold})"
+                    )
+                elif word_count < min_words:
+                    reject_reason = (
+                        f"quality_gate: too_short={word_count} words "
+                        f"(min={min_words})"
+                    )
+                elif word_count > max_words:
+                    reject_reason = (
+                        f"quality_gate: too_long={word_count} words "
+                        f"(max={max_words})"
+                    )
+
+                if reject_reason:
+                    duration = int((time.monotonic() - start) * 1000)
+                    await self.db.async_mark_failed(
+                        asset_id, reject_reason, provider_url, duration,
+                        provider_id=used_provider_id, model_used=model_used,
+                    )
+                    logger.warning(
+                        f"Quality gate blocked {asset_id[:12]}... "
+                        f"{reject_reason}"
+                    )
+                    return "failed"
+
             # Write back to Immich
             await self.immich.update_description(asset_id, description)
 
@@ -972,7 +1081,7 @@ class ProcessingEngine:
                 asset_id, desc_hash(description), description,
                 provider_url, duration,
                 provider_id=used_provider_id, model_used=model_used,
-                prompt_used=prompt_text,
+                prompt_used=prompt_text, quality_score=quality_score,
             )
             count = self.progress.done + self.progress.failed + self.progress.skipped + 1
             logger.info(
@@ -1005,31 +1114,32 @@ class ProcessingEngine:
         self.progress.started_at = datetime.now().isoformat()
         self.progress.message = "Fetching asset list..."
 
-        overwrite = self.db.get_config("overwrite_existing", "false") == "true"
-
         try:
             # Fetch assets
             since = None
-            if not overwrite and not resume:
+            if not resume:
                 since = self.db.get_last_run_timestamp()
 
-            assets = await self.immich.get_all_image_assets(
-                since=since if not overwrite else None,
-            )
+            assets = await self.immich.get_all_image_assets(since=since)
             logger.info(f"Found {len(assets)} image assets")
 
+            # Store the actual library count from Immich (ground truth)
+            if resume:  # resume fetches ALL assets, so count is accurate
+                self.db.conn.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) "
+                    "VALUES ('library_count', ?)",
+                    (str(len(assets)),),
+                )
+                self.db.conn.commit()
+
             # Filter already-processed
-            if overwrite:
-                self.db.clear_all()
-                to_process = assets
-            else:
-                processed_ids = self.db.get_processed_ids()
-                to_process = [a for a in assets if a["id"] not in processed_ids]
+            processed_ids = self.db.get_processed_ids()
+            to_process = [a for a in assets if a["id"] not in processed_ids]
 
             # Apply skip filters
             final = []
             for asset in to_process:
-                reason = self.should_skip(asset, overwrite)
+                reason = self.should_skip(asset)
                 if reason and reason != "already_processed":
                     self.db.mark_skipped(asset["id"], reason)
                     self.progress.skipped += 1
@@ -1309,3 +1419,83 @@ class ProcessingEngine:
         """Signal the batch to stop gracefully."""
         self._stop_event.set()
         self.progress.message = "Stopping..."
+
+    async def run_audit(self) -> dict:
+        """Audit existing descriptions: fetch from Immich, score, fail bad ones."""
+        threshold = float(self.db.get_config("repetition_threshold", "0.3"))
+        min_words = int(self.db.get_config("min_words", "10"))
+        max_words = int(self.db.get_config("max_words", "300"))
+        unscored = self.db.get_unscored_done_ids()
+
+        if not unscored:
+            return {"total": 0, "scored": 0, "flagged": 0}
+
+        self.progress.message = f"Auditing {len(unscored)} descriptions..."
+        self.progress.running = True
+
+        scored = 0
+        flagged = 0
+
+        try:
+            for i, asset_id in enumerate(unscored):
+                if self._stop_event.is_set():
+                    break
+
+                try:
+                    detail = await self.immich.get_asset(asset_id)
+                    description = (
+                        detail.get("exifInfo", {}).get("description") or ""
+                    )
+
+                    if not description:
+                        continue
+
+                    score = compute_repetition_score(description)
+                    word_count = len(description.split())
+                    scored += 1
+
+                    reject_reason = None
+                    if score > threshold:
+                        reject_reason = (
+                            f"quality_audit: repetition_score={score:.2f} "
+                            f"(threshold={threshold})"
+                        )
+                    elif word_count < min_words:
+                        reject_reason = (
+                            f"quality_audit: too_short={word_count} words "
+                            f"(min={min_words})"
+                        )
+                    elif word_count > max_words:
+                        reject_reason = (
+                            f"quality_audit: too_long={word_count} words "
+                            f"(max={max_words})"
+                        )
+
+                    if reject_reason:
+                        self.db.fail_from_audit(asset_id, score, reject_reason)
+                        flagged += 1
+                        logger.info(
+                            f"Audit flagged {asset_id[:12]}... "
+                            f"{reject_reason}"
+                        )
+                    else:
+                        self.db.update_quality_score(asset_id, score)
+
+                except Exception as e:
+                    logger.debug(f"Audit skip {asset_id[:12]}...: {e}")
+
+                if (i + 1) % 50 == 0:
+                    self.progress.message = (
+                        f"Auditing... {i + 1}/{len(unscored)} "
+                        f"({flagged} flagged)"
+                    )
+
+        finally:
+            self.progress.running = False
+            self.progress.message = (
+                f"Audit complete: {scored} scored, {flagged} flagged"
+            )
+
+        stats = {"total": len(unscored), "scored": scored, "flagged": flagged}
+        logger.info(f"Audit complete: {stats}")
+        return stats
