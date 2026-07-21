@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import random
@@ -9,6 +10,7 @@ import time as _time
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -22,6 +24,8 @@ from engine import (
     ProcessingEngine,
     PromptBuilder,
     StateDB,
+    auth_headers,
+    build_chat_body,
 )
 
 logging.basicConfig(
@@ -50,7 +54,7 @@ def build_engine():
     global engine
     config = {**DEFAULT_CONFIG, **state_db.get_all_config()}
 
-    providers = state_db.get_providers(enabled_only=True)
+    providers = state_db.get_providers(enabled_only=True, include_secrets=True)
     llm_pool = LLMPool(providers=providers)
 
     prompt_builder = PromptBuilder(template=config.get("prompt_template"))
@@ -90,6 +94,7 @@ def _migrate_old_config():
             "timeout": timeout,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "extra_params": DEFAULT_EXTRA_PARAMS,
         })
     logger.info(f"Migrated {len(endpoints)} old endpoint(s) to providers table")
 
@@ -147,8 +152,7 @@ async def dashboard(request: Request):
     recent = state_db.get_recent(20) if state_db else []
     progress = engine.progress if engine else None
 
-    return templates.TemplateResponse("index.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "index.html", {
         "config": config,
         "stats": stats,
         "runs": runs,
@@ -242,17 +246,49 @@ async def save_settings(request: Request):
 
 # --- Provider CRUD ---
 
+DEFAULT_EXTRA_PARAMS = json.dumps(
+    {"top_k": 40, "top_p": 0.95, "min_p": 0.05, "repeat_penalty": 1.1, "reasoning_format": "none"},
+    indent=2,
+)
 
-def _render_provider_card(p: dict, models_html: str = "") -> str:
+# 1x1 transparent PNG — enough for a "does this provider/key/params combo work" test call.
+TEST_IMAGE_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+def _pretty_json(raw: str) -> str:
+    """Pretty-print stored extra_params JSON; falls back to the raw string if it's malformed
+    so a bad edit is never silently discarded — the user sees exactly what they typed."""
+    try:
+        return json.dumps(json.loads(raw), indent=2)
+    except (TypeError, ValueError):
+        return raw or "{}"
+
+
+def _render_provider_card(p: dict, models_html: str = "", error: str = "") -> str:
     """Render a single provider card form."""
     pid = p.get("id", "new")
+    is_new = pid == "new"
     checked = "checked" if p.get("enabled", 1) else ""
     enabled_dot = "dot-ok" if p.get("enabled", 1) else "dot-err"
+    extra_params = DEFAULT_EXTRA_PARAMS if is_new else _pretty_json(p.get("extra_params") or "{}")
+    last4 = p.get("api_key_last4")
+    key_placeholder = (
+        f"•••• saved (…{last4}) · leave blank to keep" if last4
+        else "sk-... (optional, for hosted APIs)"
+    )
+    # Existing cards auto-save themselves in place; the "new" card (client-side only,
+    # see addProviderCard() in index.html) still targets the full list on its one-time Save.
+    target = "#provider-list" if is_new else f"#provider-{pid}"
+    swap = "innerHTML" if is_new else "outerHTML"
+    error_html = f'<p class="text-err text-xs font-mono">{escape(error)}</p>' if error else ""
     return f"""
     <div class="glass p-5 provider-card" id="provider-{pid}">
-      <form hx-post="/providers" hx-target="#provider-list" hx-swap="innerHTML"
-            {'hx-trigger="change delay:500ms"' if pid != 'new' else ''} class="space-y-4">
-        <input type="hidden" name="id" value="{pid if pid != 'new' else ''}">
+      <form hx-post="/providers" hx-target="{target}" hx-swap="{swap}"
+            {'hx-trigger="change delay:500ms"' if not is_new else ''} class="space-y-4">
+        <input type="hidden" name="id" value="{pid if not is_new else ''}">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-2">
             <span class="dot {enabled_dot}"></span>
@@ -262,9 +298,11 @@ def _render_provider_card(p: dict, models_html: str = "") -> str:
             <label class="flex items-center gap-2 text-xs text-txt-3 cursor-pointer">
               <input type="checkbox" name="enabled" value="1" {checked}> Enabled
             </label>
-            {f'<button type="button" hx-delete="/providers/{pid}" hx-target="#provider-list" hx-swap="innerHTML" hx-confirm="Delete this provider?" class="text-err hover:text-err text-xs opacity-60 hover:opacity-100 transition-opacity">Delete</button>' if pid != 'new' else ''}
+            {f'<button type="button" hx-delete="/providers/{pid}" hx-target="#provider-list" hx-swap="innerHTML" hx-confirm="Delete this provider?" class="text-err hover:text-err text-xs opacity-60 hover:opacity-100 transition-opacity">Delete</button>' if not is_new else ''}
           </div>
         </div>
+
+        {error_html}
 
         <div class="flex gap-2">
           <input name="url" value="{escape(p.get('url', ''))}" placeholder="http://your-llm-server:1234/v1"
@@ -281,6 +319,17 @@ def _render_provider_card(p: dict, models_html: str = "") -> str:
           </div>
         </div>
 
+        <div>
+          <label class="block text-xs text-txt-3 mb-1.5">API Key</label>
+          <div class="flex gap-2 items-center">
+            <input type="password" name="api_key" value="" placeholder="{escape(key_placeholder)}"
+                   autocomplete="off" class="input-field flex-1 font-mono">
+            <label class="flex items-center gap-1.5 text-xs text-txt-3 cursor-pointer whitespace-nowrap">
+              <input type="checkbox" name="clear_api_key" value="1"> Remove key
+            </label>
+          </div>
+        </div>
+
         <details class="text-xs">
           <summary class="text-txt-3 cursor-pointer hover:text-txt-2 text-xs">Parameters</summary>
           <div class="grid grid-cols-4 gap-3 mt-3">
@@ -292,18 +341,22 @@ def _render_provider_card(p: dict, models_html: str = "") -> str:
               <input name="max_tokens" type="number" value="{p.get('max_tokens', 500)}" class="input-field text-xs"></div>
             <div><label class="block text-txt-3 mb-1 text-xs">Temperature</label>
               <input name="temperature" type="number" step="0.05" value="{p.get('temperature', 0.7)}" class="input-field text-xs"></div>
-            <div><label class="block text-txt-3 mb-1 text-xs">Top K</label>
-              <input name="top_k" type="number" value="{p.get('top_k', 40)}" class="input-field text-xs"></div>
-            <div><label class="block text-txt-3 mb-1 text-xs">Top P</label>
-              <input name="top_p" type="number" step="0.05" value="{p.get('top_p', 0.95)}" class="input-field text-xs"></div>
-            <div><label class="block text-txt-3 mb-1 text-xs">Min P</label>
-              <input name="min_p" type="number" step="0.01" value="{p.get('min_p', 0.05)}" class="input-field text-xs"></div>
-            <div><label class="block text-txt-3 mb-1 text-xs">Repeat Penalty</label>
-              <input name="repeat_penalty" type="number" step="0.05" value="{p.get('repeat_penalty', 1.1)}" class="input-field text-xs"></div>
+          </div>
+          <div class="mt-3">
+            <label class="block text-txt-3 mb-1 text-xs">Extra request body params (JSON, merged into every request)</label>
+            <textarea name="extra_params" rows="6" spellcheck="false"
+                      class="input-field text-xs font-mono w-full">{escape(extra_params)}</textarea>
           </div>
         </details>
 
-        {'' if pid != 'new' else '<button type="submit" class="btn btn-warm btn-sm">Save</button>'}
+        <div id="test-result-{pid}" class="text-xs"></div>
+
+        <div class="flex gap-2 items-center">
+          <button type="button" hx-post="/providers/test" hx-include="closest form"
+                  hx-target="#test-result-{pid}" hx-swap="innerHTML"
+                  class="btn btn-ghost btn-sm">Test</button>
+          {'' if not is_new else '<button type="submit" class="btn btn-warm btn-sm">Save</button>'}
+        </div>
       </form>
     </div>"""
 
@@ -319,6 +372,19 @@ async def list_providers():
     return HTMLResponse(cards)
 
 
+def _resolve_test_api_key(form) -> Optional[str]:
+    """Typed key wins; otherwise fall back to the stored (decrypted) key for an
+    existing provider, so Validate/Test work without retyping an already-saved key."""
+    api_key = (form.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    pid = (form.get("id") or "").strip()
+    if not pid:
+        return None
+    stored = state_db.get_provider(int(pid), include_secrets=True)
+    return stored.get("api_key") if stored else None
+
+
 @app.post("/providers/validate", response_class=HTMLResponse)
 async def validate_provider(request: Request):
     form = await request.form()
@@ -326,9 +392,16 @@ async def validate_provider(request: Request):
     current_model = (form.get("model") or "").strip()
     if not url:
         return HTMLResponse('<span class="text-err text-xs">No URL</span>')
+
+    try:
+        api_key = _resolve_test_api_key(form)
+    except Exception:
+        return HTMLResponse('<span class="text-err text-xs">Could not read stored key</span>')
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{url}/models")
+            resp = await client.get(f"{url}/models", headers=headers)
             if resp.status_code == 200:
                 models = resp.json().get("data", [])
                 names = [m.get("id", "?") for m in models]
@@ -348,9 +421,65 @@ async def validate_provider(request: Request):
         return HTMLResponse(f'<span class="text-err text-xs">{escape(str(e))}</span>')
 
 
+@app.post("/providers/test", response_class=HTMLResponse)
+async def test_provider(request: Request):
+    """Fires one real chat-completion request with the form's current url/model/key/
+    extra_params so a hosted provider's rejection (bad param, bad key, ...) shows up
+    verbatim before the provider is trusted with a full batch run."""
+    form = await request.form()
+    url = (form.get("url") or "").strip().rstrip("/")
+    model = (form.get("model") or "").strip()
+    if not url or not model:
+        return HTMLResponse('<span class="text-err text-xs">URL and model required to test</span>')
+
+    extra_params_raw = (form.get("extra_params") or "{}").strip()
+    try:
+        json.loads(extra_params_raw or "{}")
+    except json.JSONDecodeError as e:
+        return HTMLResponse(f'<span class="text-err text-xs font-mono">Invalid extra params JSON: {escape(str(e))}</span>')
+
+    try:
+        api_key = _resolve_test_api_key(form)
+    except Exception:
+        return HTMLResponse('<span class="text-err text-xs">Could not read stored key — re-enter it to test</span>')
+
+    provider = {
+        "id": (form.get("id") or "").strip() or "test",
+        "url": url,
+        "model": model,
+        "api_key": api_key,
+        "max_tokens": 10,
+        "temperature": float(form.get("temperature", 0.7)),
+        "extra_params": extra_params_raw,
+    }
+    body = build_chat_body(provider, "Reply with just OK.", TEST_IMAGE_B64)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(f"{url}/chat/completions", json=body, headers=auth_headers(provider))
+        if resp.status_code >= 400:
+            return HTMLResponse(
+                f'<span class="text-err text-xs font-mono">HTTP {resp.status_code}: {escape(resp.text[:500])}</span>'
+            )
+        data = resp.json()
+        reply = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        return HTMLResponse(f'<span class="text-ok text-xs">OK — provider responded: {escape(reply[:200])}</span>')
+    except httpx.TimeoutException:
+        return HTMLResponse('<span class="text-err text-xs">Timed out</span>')
+    except Exception as e:
+        return HTMLResponse(f'<span class="text-err text-xs">{escape(str(e))}</span>')
+
+
 @app.post("/providers", response_class=HTMLResponse)
 async def save_provider(request: Request):
     form = await request.form()
+
+    extra_params_raw = (form.get("extra_params") or "{}").strip()
+    try:
+        json.loads(extra_params_raw or "{}")
+    except json.JSONDecodeError as e:
+        return await _provider_save_error(form, f"Invalid extra params JSON: {e}")
+
     data = {
         "url": (form.get("url") or "").strip().rstrip("/"),
         "model": (form.get("model") or "").strip(),
@@ -358,24 +487,49 @@ async def save_provider(request: Request):
         "timeout": int(form.get("timeout", 120)),
         "max_tokens": int(form.get("max_tokens", 500)),
         "temperature": float(form.get("temperature", 0.7)),
-        "top_k": int(form.get("top_k", 40)),
-        "top_p": float(form.get("top_p", 0.95)),
-        "min_p": float(form.get("min_p", 0.05)),
-        "repeat_penalty": float(form.get("repeat_penalty", 1.1)),
         "enabled": 1 if form.get("enabled") else 0,
+        "extra_params": extra_params_raw,
     }
+    api_key = (form.get("api_key") or "").strip()
+    if api_key:
+        data["api_key"] = api_key
+    elif form.get("clear_api_key"):
+        data["clear_api_key"] = True
 
     if not data["url"] or not data["model"]:
-        return HTMLResponse('<span class="text-err text-xs font-mono">URL and model required</span>')
+        return await _provider_save_error(form, "URL and model required")
 
     pid = (form.get("id") or "").strip()
     if pid:
         state_db.update_provider(int(pid), data)
+        build_engine()
+        updated = state_db.get_provider(int(pid))
+        return HTMLResponse(_render_provider_card(updated))
     else:
         state_db.add_provider(data)
+        build_engine()
+        return await list_providers()
 
-    build_engine()
-    return await list_providers()
+
+async def _provider_save_error(form, message: str) -> HTMLResponse:
+    """On validation failure, re-render the card (not just an error span) so an
+    existing provider's outerHTML auto-save target doesn't get replaced with a
+    dead-end error — the form has to survive so the user can fix and resubmit."""
+    pid = (form.get("id") or "").strip()
+    if not pid:
+        return HTMLResponse(f'<span class="text-err text-xs font-mono">{escape(message)}</span>')
+    display = state_db.get_provider(int(pid)) or {"id": int(pid)}
+    display.update({
+        "url": form.get("url", display.get("url", "")),
+        "model": form.get("model", display.get("model", "")),
+        "concurrency": form.get("concurrency", display.get("concurrency")),
+        "timeout": form.get("timeout", display.get("timeout")),
+        "max_tokens": form.get("max_tokens", display.get("max_tokens")),
+        "temperature": form.get("temperature", display.get("temperature")),
+        "enabled": 1 if form.get("enabled") else 0,
+        "extra_params": form.get("extra_params", display.get("extra_params")),
+    })
+    return HTMLResponse(_render_provider_card(display, error=message))
 
 
 @app.delete("/providers/{provider_id}", response_class=HTMLResponse)

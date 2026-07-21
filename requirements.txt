@@ -4,3 +4,4 @@ httpx
 jinja2
 psycopg[binary]
 python-multipart
+cryptography

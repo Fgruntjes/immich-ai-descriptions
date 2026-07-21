@@ -11,7 +11,9 @@ Components:
 import asyncio
 import base64
 import hashlib
+import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger("custom-ai-desc")
 
@@ -57,8 +60,16 @@ class ProviderDisabledError(Exception):
 
 
 class ProviderTransientError(Exception):
-    """Raised when a provider is temporarily unavailable (connection, timeout, 5xx)."""
-    pass
+    """Raised when a provider is temporarily unavailable (connection, timeout, 5xx).
+
+    Attributes:
+        server_error: True if the server responded with 5xx (up but can't serve).
+                      False for connection/timeout errors (server unreachable).
+    """
+
+    def __init__(self, message: str, server_error: bool = False):
+        super().__init__(message)
+        self.server_error = server_error
 
 
 # --- Helpers ---
@@ -104,7 +115,42 @@ class StateDB:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.row_factory = sqlite3.Row
         self._lock = asyncio.Lock()
+        self._fernet = self._load_or_create_secret(Path(db_path).parent / "secret.key")
         self._init_schema()
+
+    @staticmethod
+    def _load_or_create_secret(path: Path) -> Fernet:
+        """Load the Fernet key used to encrypt provider API keys, generating it on first run.
+
+        O_EXCL ensures two racing startups can't both "win" the create — the loser just
+        falls through to the read. Failing here (e.g. read-only volume) is preferable to
+        failing later mid-request.
+        """
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, Fernet.generate_key())
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            pass
+        return Fernet(path.read_bytes())
+
+    def _encrypt_api_key(self, plain: str) -> str:
+        return self._fernet.encrypt(plain.encode()).decode()
+
+    def _decrypt_api_key(self, ciphertext: str) -> Optional[str]:
+        try:
+            return self._fernet.decrypt(ciphertext.encode()).decode()
+        except InvalidToken:
+            logger.error("Could not decrypt stored provider API key (secret.key changed?) — treating as unset")
+            return None
+
+    def _encode_api_key(self, plain: Optional[str]) -> tuple:
+        """Returns (encrypted, last4) for storage, or (None, None) if no key given."""
+        if not plain:
+            return None, None
+        return self._encrypt_api_key(plain), plain[-4:]
 
     def _init_schema(self):
         self.conn.executescript("""
@@ -188,6 +234,38 @@ class StateDB:
             )
             self.conn.commit()
             logger.info("Migrated schema to v3 (quality_score column)")
+
+        if version < 4:
+            for col in ("api_key_encrypted TEXT", "api_key_last4 TEXT", "extra_params TEXT"):
+                try:
+                    self.conn.execute(f"ALTER TABLE providers ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
+            # Backfill extra_params from the old dedicated sampling columns so
+            # existing providers keep sending identical request bodies.
+            rows = self.conn.execute(
+                "SELECT id, top_k, top_p, min_p, repeat_penalty FROM providers "
+                "WHERE extra_params IS NULL"
+            ).fetchall()
+            for row in rows:
+                params = {
+                    "top_k": row["top_k"],
+                    "top_p": row["top_p"],
+                    "min_p": row["min_p"],
+                    "repeat_penalty": row["repeat_penalty"],
+                    "reasoning_format": "none",
+                }
+                self.conn.execute(
+                    "UPDATE providers SET extra_params = ? WHERE id = ?",
+                    (json.dumps(params), row["id"]),
+                )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) "
+                "VALUES ('schema_version', '4')"
+            )
+            self.conn.commit()
+            logger.info("Migrated schema to v4 (api_key + extra_params columns)")
 
     def get_config(self, key: str, default: str = None) -> Optional[str]:
         row = self.conn.execute(
@@ -379,33 +457,42 @@ class StateDB:
 
     # --- Provider CRUD ---
 
-    def get_providers(self, enabled_only: bool = False) -> list[dict]:
+    def _prepare_provider(self, p: dict, include_secrets: bool) -> dict:
+        """Strip ciphertext from the dict; decrypt into plaintext `api_key` only when asked."""
+        p["api_key"] = None
+        if include_secrets and p.get("api_key_encrypted"):
+            p["api_key"] = self._decrypt_api_key(p["api_key_encrypted"])
+        p.pop("api_key_encrypted", None)
+        return p
+
+    def get_providers(self, enabled_only: bool = False, include_secrets: bool = False) -> list[dict]:
         if enabled_only:
             rows = self.conn.execute(
                 "SELECT * FROM providers WHERE enabled = 1"
             ).fetchall()
         else:
             rows = self.conn.execute("SELECT * FROM providers").fetchall()
-        return [dict(r) for r in rows]
+        return [self._prepare_provider(dict(r), include_secrets) for r in rows]
 
-    def get_provider(self, provider_id: int) -> Optional[dict]:
+    def get_provider(self, provider_id: int, include_secrets: bool = False) -> Optional[dict]:
         row = self.conn.execute(
             "SELECT * FROM providers WHERE id = ?", (provider_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return self._prepare_provider(dict(row), include_secrets) if row else None
 
     def add_provider(self, data: dict) -> int:
+        api_key_encrypted, api_key_last4 = self._encode_api_key(data.get("api_key"))
         cursor = self.conn.execute(
             """INSERT INTO providers (url, model, concurrency, timeout, max_tokens,
-               temperature, top_k, top_p, min_p, repeat_penalty, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               temperature, enabled, api_key_encrypted, api_key_last4, extra_params)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 data["url"], data["model"],
                 data.get("concurrency", 4), data.get("timeout", 120),
                 data.get("max_tokens", 500), data.get("temperature", 0.7),
-                data.get("top_k", 40), data.get("top_p", 0.95),
-                data.get("min_p", 0.05), data.get("repeat_penalty", 1.1),
                 data.get("enabled", 1),
+                api_key_encrypted, api_key_last4,
+                data.get("extra_params", "{}"),
             ),
         )
         self.conn.commit()
@@ -415,10 +502,21 @@ class StateDB:
         fields = []
         values = []
         for key in ("url", "model", "concurrency", "timeout", "max_tokens",
-                     "temperature", "top_k", "top_p", "min_p", "repeat_penalty", "enabled"):
+                     "temperature", "enabled", "extra_params"):
             if key in data:
                 fields.append(f"{key} = ?")
                 values.append(data[key])
+
+        # api_key handling: blank field (key absent from `data`) keeps the existing
+        # key untouched. A typed key always wins over "clear_api_key" if both are set.
+        if data.get("api_key"):
+            encrypted, last4 = self._encode_api_key(data["api_key"])
+            fields += ["api_key_encrypted = ?", "api_key_last4 = ?"]
+            values += [encrypted, last4]
+        elif data.get("clear_api_key"):
+            fields += ["api_key_encrypted = ?", "api_key_last4 = ?"]
+            values += [None, None]
+
         if fields:
             values.append(provider_id)
             self.conn.execute(
@@ -598,6 +696,53 @@ class ImmichClient:
 
 # --- LLMPool ---
 
+def build_chat_body(provider: dict, prompt: str, image_b64: str) -> dict:
+    """Builds the OpenAI-compatible chat completion request body for a provider.
+
+    Only `model`/`messages`/`max_tokens`/`temperature`/`stream` are fixed. Everything
+    else (top_k, top_p, min_p, repeat_penalty, reasoning_format, or any other
+    provider-specific field) comes from the provider's freeform `extra_params` JSON
+    blob, merged in last — this is what lets a provider that rejects a given param
+    (e.g. OpenAI rejecting `repeat_penalty`) simply omit it instead of the app
+    hardcoding a one-size-fits-all param set.
+    """
+    body = {
+        "model": provider["model"],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_b64}",
+                }},
+            ],
+        }],
+        "max_tokens": provider.get("max_tokens", 500),
+        "temperature": provider.get("temperature", 0.7),
+        "stream": False,
+    }
+    extra = provider.get("extra_params")
+    if extra:
+        try:
+            body.update(json.loads(extra))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                f"Provider {provider.get('id')}: invalid extra_params JSON, ignoring"
+            )
+    return body
+
+
+def auth_headers(provider: dict) -> dict:
+    """Authorization header for a provider's API key, read fresh each call.
+
+    Not baked into the httpx client at construction time — that would mean a
+    key added/changed via Settings never takes effect until the client is
+    rebuilt, which nothing currently does for an already-known provider id.
+    """
+    key = provider.get("api_key")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 class LLMPool:
     """Per-provider LLM pool with round-robin, semaphores, and health checks."""
 
@@ -653,6 +798,9 @@ class LLMPool:
                    ("404" in err_lower and "model" in err_lower):
                     logger.error(f"Disabling provider {provider['id']}: model not found")
                     self._disabled.add(provider["id"])
+                elif isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
+                    logger.error(f"Disabling provider {provider['id']}: auth error ({e.response.status_code})")
+                    self._disabled.add(provider["id"])
 
     async def generate_with(self, provider_id: int, prompt: str,
                             image_b64: str) -> tuple[str, int, str]:
@@ -679,42 +827,32 @@ class LLMPool:
             if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
                 self._disabled.add(provider_id)
                 raise ProviderDisabledError(str(e)) from e
+            # Permanent: bad/missing/expired API key — won't fix itself on retry
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
+                self._disabled.add(provider_id)
+                raise ProviderDisabledError(str(e)) from e
+            # Transient: rate limited — back off and retry, don't disable
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 429:
+                raise ProviderTransientError(str(e)) from e
             # Transient: connection errors, timeouts
             if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout,
                               httpx.ReadTimeout, httpx.WriteTimeout,
                               httpx.PoolTimeout, ConnectionError, OSError)):
                 raise ProviderTransientError(str(e)) from e
-            # Transient: 5xx server errors
+            # Transient: 5xx server errors (server up but can't serve)
             if isinstance(e, httpx.HTTPStatusError):
                 if e.response.status_code >= 500:
-                    raise ProviderTransientError(str(e)) from e
+                    raise ProviderTransientError(str(e), server_error=True) from e
             raise  # asset-level error — let process_asset handle it
 
     async def _call(self, provider: dict, prompt: str, image_b64: str) -> str:
         url = provider["url"].rstrip("/")
-        body = {
-            "model": provider["model"],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_b64}",
-                    }},
-                ],
-            }],
-            "max_tokens": provider.get("max_tokens", 500),
-            "temperature": provider.get("temperature", 0.7),
-            "top_k": provider.get("top_k", 40),
-            "top_p": provider.get("top_p", 0.95),
-            "min_p": provider.get("min_p", 0.05),
-            "repeat_penalty": provider.get("repeat_penalty", 1.1),
-            "stream": False,
-            "reasoning_format": "none",
-        }
+        body = build_chat_body(provider, prompt, image_b64)
 
         client = self._clients[provider["id"]]
-        resp = await client.post(f"{url}/chat/completions", json=body)
+        resp = await client.post(
+            f"{url}/chat/completions", json=body, headers=auth_headers(provider),
+        )
         resp.raise_for_status()
         data = resp.json()
 
@@ -738,21 +876,27 @@ class LLMPool:
             url = p["url"].rstrip("/")
             try:
                 client = self._clients[p["id"]]
-                resp = await client.get(f"{url}/models", timeout=5.0)
+                resp = await client.get(f"{url}/models", timeout=5.0, headers=auth_headers(p))
                 results[p["id"]] = {"url": url, "model": p["model"], "online": resp.status_code == 200}
             except Exception:
                 results[p["id"]] = {"url": url, "model": p["model"], "online": False}
         return results
 
     async def check_provider_health(self, provider_id: int) -> bool:
-        """Quick health check for a single provider. Returns True if online."""
+        """Quick reachability check — is the server responding at all?
+
+        Uses GET /models (cheap, no inference).  This is appropriate for
+        connection-level failures (server down, network issues).  For 5xx
+        errors (server up but can't serve, e.g. GPU VRAM exhausted), the
+        worker uses timed backoff instead of health-checking.
+        """
         provider = next((p for p in self.providers if p["id"] == provider_id), None)
         if not provider:
             return False
         url = provider["url"].rstrip("/")
         try:
             client = self._clients[provider_id]
-            resp = await client.get(f"{url}/models", timeout=5.0)
+            resp = await client.get(f"{url}/models", timeout=5.0, headers=auth_headers(provider))
             return resp.status_code == 200
         except Exception:
             return False
@@ -1006,6 +1150,12 @@ class ProcessingEngine:
                 people=people_names,
             )
 
+            # Check thumbnail exists before downloading (null thumbhash = corrupt/unprocessed)
+            if not detail.get("thumbhash"):
+                await self.db.async_mark_failed(asset_id, "no_thumbhash")
+                logger.warning(f"Skipping {asset_id[:12]}...: no thumbhash (corrupt or unprocessed asset)")
+                return "failed"
+
             # Get thumbnail
             thumb = await self.immich.get_thumbnail(asset_id)
             if not thumb:
@@ -1170,6 +1320,8 @@ class ProcessingEngine:
                 queue.put_nowait(asset)
 
             BACKOFF_SCHEDULE = [5, 10, 30, 60]  # seconds
+            MAX_BACKOFF_ROUNDS = 5  # give up on provider after this many consecutive backoff cycles
+            retry_counts: dict[str, int] = {}  # asset_id -> re-queue count
 
             async def worker(worker_provider_id: int):
                 while True:
@@ -1201,42 +1353,82 @@ class ProcessingEngine:
                         return
                     except ProviderTransientError as e:
                         logger.warning(
-                            f"Provider {worker_provider_id} transient error: {e}"
+                            f"Provider {worker_provider_id} transient error "
+                            f"({'5xx' if e.server_error else 'connection'}): {e}"
                         )
                         queue.put_nowait(asset)
 
-                        # Backoff + health-check loop
                         if worker_provider_id in self.progress.provider_stats:
                             self.progress.provider_stats[worker_provider_id]["status"] = "backoff"
 
-                        recovered = False
-                        attempt = 0
-                        while not self._stop_event.is_set():
-                            delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
-                            # Sleep interruptibly — wake instantly on stop
-                            try:
-                                await asyncio.wait_for(
-                                    self._stop_event.wait(), timeout=delay,
-                                )
-                                return  # stop event was set
-                            except asyncio.TimeoutError:
-                                pass  # normal: delay elapsed, check health
-                            healthy = await self.llm.check_provider_health(
-                                worker_provider_id,
-                            )
-                            if healthy:
+                        if e.server_error:
+                            # Server responded with 5xx — it's up but can't serve
+                            # (e.g. GPU VRAM exhausted). Health-checking is useless
+                            # here (GET /models returns 200 anyway). Just wait with
+                            # longer delays and let the resource contention resolve.
+                            SERVER_BACKOFF = [30, 60, 120, 300]  # seconds
+                            attempt = 0
+                            while not self._stop_event.is_set() and attempt < MAX_BACKOFF_ROUNDS:
+                                delay = SERVER_BACKOFF[min(attempt, len(SERVER_BACKOFF) - 1)]
                                 logger.info(
-                                    f"Provider {worker_provider_id} recovered"
+                                    f"Provider {worker_provider_id} server error, "
+                                    f"waiting {delay}s (attempt {attempt + 1}/{MAX_BACKOFF_ROUNDS})"
                                 )
-                                recovered = True
-                                break
-                            attempt += 1
+                                try:
+                                    await asyncio.wait_for(
+                                        self._stop_event.wait(), timeout=delay,
+                                    )
+                                    return  # stop event was set
+                                except asyncio.TimeoutError:
+                                    pass
+                                attempt += 1
+                            # After waiting, just resume and let the next attempt
+                            # either succeed or fail again naturally
+                            if not self._stop_event.is_set():
+                                if worker_provider_id in self.progress.provider_stats:
+                                    self.progress.provider_stats[worker_provider_id]["status"] = "active"
+                                continue
+                            return
+                        else:
+                            # Connection error — server unreachable. Health-check
+                            # until it comes back or we exhaust retries.
+                            recovered = False
+                            attempt = 0
+                            while not self._stop_event.is_set() and attempt < MAX_BACKOFF_ROUNDS:
+                                delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
+                                try:
+                                    await asyncio.wait_for(
+                                        self._stop_event.wait(), timeout=delay,
+                                    )
+                                    return
+                                except asyncio.TimeoutError:
+                                    pass
+                                healthy = await self.llm.check_provider_health(
+                                    worker_provider_id,
+                                )
+                                if healthy:
+                                    logger.info(
+                                        f"Provider {worker_provider_id} recovered"
+                                    )
+                                    recovered = True
+                                    break
+                                attempt += 1
 
-                        if recovered:
-                            if worker_provider_id in self.progress.provider_stats:
-                                self.progress.provider_stats[worker_provider_id]["status"] = "active"
-                            continue  # resume pulling from queue
-                        return  # stopped during backoff
+                            if not recovered and not self._stop_event.is_set():
+                                logger.warning(
+                                    f"Provider {worker_provider_id} exhausted "
+                                    f"{MAX_BACKOFF_ROUNDS} backoff rounds, "
+                                    f"worker exiting"
+                                )
+                                if worker_provider_id in self.progress.provider_stats:
+                                    self.progress.provider_stats[worker_provider_id]["status"] = "exhausted"
+                                return
+
+                            if recovered:
+                                if worker_provider_id in self.progress.provider_stats:
+                                    self.progress.provider_stats[worker_provider_id]["status"] = "active"
+                                continue
+                            return
 
                     # Normal result handling
                     if result == "done":
@@ -1277,7 +1469,7 @@ class ProcessingEngine:
                         return
 
                     try:
-                        all_db_providers = self.db.get_providers()
+                        all_db_providers = self.db.get_providers(include_secrets=True)
                     except Exception:
                         continue
 
@@ -1375,6 +1567,25 @@ class ProcessingEngine:
                         logger.error(f"Worker crashed: {exc}")
 
                 if not active_workers and queue.empty():
+                    break
+
+                # All workers exited but queue still has items —
+                # all providers exhausted/disabled, mark remaining as failed
+                if not active_workers and not queue.empty():
+                    remaining = queue.qsize()
+                    logger.warning(
+                        f"All workers exited with {remaining} assets "
+                        f"still in queue — marking as failed"
+                    )
+                    while not queue.empty():
+                        try:
+                            stuck = queue.get_nowait()
+                            await self.db.async_mark_failed(
+                                stuck["id"], "all_providers_exhausted",
+                            )
+                            self.progress.failed += 1
+                        except asyncio.QueueEmpty:
+                            break
                     break
 
                 await asyncio.sleep(1)
