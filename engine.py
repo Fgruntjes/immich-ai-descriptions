@@ -1099,6 +1099,8 @@ class ProcessingEngine:
                 return "stack_child"
 
         if not overwrite:
+            if (asset.get("exifInfo") or {}).get("description"):
+                return "has_description"
             status = self.db.is_processed(asset["id"])
             if status in ("done", "skipped"):
                 return "already_processed"
